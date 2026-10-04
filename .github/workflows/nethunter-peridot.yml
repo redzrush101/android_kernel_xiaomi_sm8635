@@ -1,0 +1,191 @@
+name: Build NetHunter kernel (POCO F6 peridot)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - nethunter-ci
+    paths:
+      - ".github/workflows/nethunter-peridot.yml"
+      - "arch/arm64/configs/vendor/peridot_nethunter.config"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nethunter-peridot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: redzrush101
+      KBUILD_BUILD_HOST: github-actions
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential clang cpio curl dwarves flex git kmod \
+            libelf-dev libssl-dev lld llvm lz4 python3 rsync unzip xz-utils zip zstd
+          clang --version
+          ld.lld --version
+
+      - name: Merge peridot + NetHunter configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          scripts/kconfig/merge_config.sh -m -O out \
+            arch/arm64/configs/gki_defconfig \
+            arch/arm64/configs/vendor/pineapple_GKI.config \
+            arch/arm64/configs/vendor/peridot_GKI.config \
+            arch/arm64/configs/vendor/peridot_nethunter.config
+
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+
+          cp out/.config nethunter-peridot.config
+
+          echo "=== Required NetHunter options ==="
+          required=(
+            CONFIG_USB_GADGET
+            CONFIG_USB_CONFIGFS
+            CONFIG_USB_CONFIGFS_F_HID
+            CONFIG_HIDRAW
+            CONFIG_TUN
+          )
+
+          for symbol in "${required[@]}"; do
+            if ! grep -q "^${symbol}=y$" out/.config; then
+              echo "::error::${symbol}=y did not survive Kconfig resolution"
+              grep -E "^(${symbol}=|# ${symbol} is not set)" out/.config || true
+              exit 1
+            fi
+            grep "^${symbol}=y$" out/.config
+          done
+
+          for symbol in CONFIG_CFG80211 CONFIG_MAC80211; do
+            if ! grep -Eq "^${symbol}=(y|m)$" out/.config; then
+              echo "::error::${symbol} is not enabled"
+              exit 1
+            fi
+            grep -E "^${symbol}=(y|m)$" out/.config
+          done
+
+          echo "=== USB Wi-Fi options that survived ==="
+          grep -E '^CONFIG_(ATH9K_HTC|RT2800USB|RTL8187|RTL8XXXU|MT76x0U|MT76x2U|MT7921U)=' out/.config || true
+
+      - name: Build kernel and in-tree modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j2 Image modules
+
+          test -s out/arch/arm64/boot/Image
+          file out/arch/arm64/boot/Image
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Stage kernel modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf module-stage
+          mkdir -p module-stage
+
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            INSTALL_MOD_PATH="$GITHUB_WORKSPACE/module-stage" modules_install
+
+          find module-stage -type l -delete
+          tar -C module-stage -czf nethunter-peridot-modules.tar.gz .
+
+          echo "=== NetHunter-oriented modules ==="
+          find module-stage -type f -name '*.ko*' | \
+            grep -E '/(ath9k_htc|ath9k_common|ath9k_hw|ath|rt2800usb|rt2800lib|rt2x00usb|rt2x00lib|rtl8187|rtl8xxxu|mt76|mac80211|cfg80211|usbserial|ftdi_sio|pl2303|cp210x)\.ko' || true
+
+      - name: Package AnyKernel3 flashable ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf anykernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel3
+
+          cp out/arch/arm64/boot/Image anykernel3/Image
+
+          cat > anykernel3/anykernel.sh <<'EOF'
+          ### AnyKernel3 setup for POCO F6 (peridot)
+
+          properties() { '
+          kernel.string=Vibranium V18 NetHunter for POCO F6
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=peridot
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          # POCO F6 uses GKI boot header v4; the ramdisk lives in init_boot.
+          # Replace only the kernel in the active-slot boot image.
+          split_boot;
+          flash_boot;
+          EOF
+
+          (
+            cd anykernel3
+            zip -r9 ../NetHunter-Vibranium-V18-peridot-AnyKernel3.zip . \
+              -x '.git/*' 'README.md' '*placeholder'
+          )
+
+          sha256sum NetHunter-Vibranium-V18-peridot-AnyKernel3.zip \
+                    nethunter-peridot-modules.tar.gz \
+                    out/arch/arm64/boot/Image > SHA256SUMS
+
+      - name: Build summary
+        shell: bash
+        run: |
+          {
+            echo "## POCO F6 NetHunter kernel build"
+            echo
+            echo "- Base: `gki_defconfig + pineapple_GKI.config + peridot_GKI.config`"
+            echo "- Additions: `peridot_nethunter.config`"
+            echo "- Kernel: `$(make -s O=out ARCH=arm64 kernelrelease)`"
+            echo "- Flashable ZIP: `NetHunter-Vibranium-V18-peridot-AnyKernel3.zip`"
+            echo "- Modules archive: `nethunter-peridot-modules.tar.gz`"
+            echo
+            echo "The AnyKernel ZIP changes only the active-slot boot kernel. The modules archive is kept separate intentionally so vendor/system DLKM is not modified during the first boot test."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload NetHunter build
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetHunter-Vibranium-V18-peridot
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            NetHunter-Vibranium-V18-peridot-AnyKernel3.zip
+            nethunter-peridot-modules.tar.gz
+            nethunter-peridot.config
+            SHA256SUMS
+            out/arch/arm64/boot/Image
