@@ -77,9 +77,12 @@ static void drain_openssl_errors(void)
 		}					\
 	} while(0)
 
-#ifdef USE_PKCS11_ENGINE
+/*
+ * key_pass is used by the OpenSSL ENGINE path even when the build does not
+ * define USE_PKCS11_ENGINE. Keep the storage available; it remains NULL unless
+ * KBUILD_SIGN_PIN support is enabled below.
+ */
 static const char *key_pass;
-#endif
 static BIO *wb;
 static char *cert_dst;
 static int kbuild_verbose;
